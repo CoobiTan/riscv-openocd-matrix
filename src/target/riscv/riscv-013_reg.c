@@ -24,7 +24,8 @@ static int riscv013_reg_get(struct reg *reg)
 		return ERROR_OK;
 	}
 
-	if (reg->number >= GDB_REGNO_V0 && reg->number <= GDB_REGNO_V31) {
+	if ((reg->number >= GDB_REGNO_V0 && reg->number <= GDB_REGNO_V31) ||
+			(reg->number >= GDB_REGNO_TR0 && reg->number <= GDB_REGNO_TR7)) {
 		if (riscv013_get_register_buf(target, reg->value, reg->number) != ERROR_OK)
 			return ERROR_FAIL;
 
@@ -58,7 +59,8 @@ static int riscv013_reg_set(struct reg *reg, uint8_t *buf)
 			buf_get_u64(buf, 0, reg->size) == 0)
 		return ERROR_OK;
 
-	if (reg->number >= GDB_REGNO_V0 && reg->number <= GDB_REGNO_V31) {
+	if ((reg->number >= GDB_REGNO_V0 && reg->number <= GDB_REGNO_V31) ||
+			(reg->number >= GDB_REGNO_TR0 && reg->number <= GDB_REGNO_TR7)) {
 		if (riscv013_set_register_buf(target, reg->number, buf) != ERROR_OK)
 			return ERROR_FAIL;
 
@@ -159,6 +161,69 @@ static int examine_vlenb(struct target *target)
 	r->vlenb = (unsigned int)vlenb_val;
 
 	LOG_TARGET_INFO(target, "Vector support with vlenb=%u", r->vlenb);
+	return ERROR_OK;
+}
+
+static int examine_mlenb(struct target *target)
+{
+	RISCV_INFO(r);
+
+	/* Reading "mlenb" requires "mstatus.ms" to be set, so "mstatus" should
+	 * be accessible.*/
+	int res = init_cache_entry(target, GDB_REGNO_MSTATUS);
+	if (res != ERROR_OK)
+		return res;
+
+	res = assume_reg_exist(target, GDB_REGNO_MLENB);
+	if (res != ERROR_OK)
+		return res;
+
+	res = assume_reg_exist(target, GDB_REGNO_MRLENB);
+	if (res != ERROR_OK)
+		return res;
+
+	riscv_reg_t value;
+	if (riscv_reg_get(target, &value, GDB_REGNO_MLENB) != ERROR_OK) {
+		if (riscv_supports_extension(target, 'Z'))
+			LOG_TARGET_WARNING(target, "Couldn't read mlenb; matrix register access won't work.");
+		r->mlenb = 0;
+		return riscv_reg_impl_set_exist(target, GDB_REGNO_MLENB, false);
+	}
+	/* As defined by RISC-V Matrix extension specification:
+	 * https://github.com/riscv-stc/riscv-matrix-spec/blob/7fb140d7fef8f6c1bf16c4b4fc81b5d121ded51f/param.adoc?plain=1#L6 */
+	const unsigned long mlen_max = 1UL << 32;
+	const unsigned long mlenb_max = mlen_max / 8;
+	if (value > mlenb_max) {
+		LOG_TARGET_WARNING(target, "'mlenb == %" PRIu64
+				"' is greater than maximum allowed by specification (%lu); matrix register access won't work.",
+				value, mlenb_max);
+		r->mlenb = 0;
+		return ERROR_OK;
+	}
+	r->mlenb = value;
+	LOG_TARGET_INFO(target, "Matrix support with mlenb=%u", r->mlenb);
+
+	if (riscv_reg_get(target, &value, GDB_REGNO_MRLENB) != ERROR_OK) {
+		if (riscv_supports_extension(target, 'Z'))
+			LOG_TARGET_WARNING(target, "Couldn't read mrlenb; matrix register access won't work.");
+		r->mrlenb = 0;
+		r->mlenb = 0;
+		return riscv_reg_impl_set_exist(target, GDB_REGNO_MRLENB, false);
+	}
+	/* As defined by RISC-V Matrix extension specification:
+	 * https://github.com/riscv-stc/riscv-matrix-spec/blob/7fb140d7fef8f6c1bf16c4b4fc81b5d121ded51f/param.adoc?plain=1#L7 */
+	const unsigned int mrlen_max = 1U << 16;
+	const unsigned int mrlenb_max = mrlen_max / 8;
+	if (value > mrlenb_max) {
+		LOG_TARGET_WARNING(target, "'mrlenb == %" PRIu64
+				"' is greater than maximum allowed by specification (%u); matrix register access won't work.",
+				value, mrlenb_max);
+		r->mrlenb = 0;
+		r->mlenb = 0;
+		return ERROR_OK;
+	}
+	r->mrlenb = value;
+	LOG_TARGET_INFO(target, "Matrix support with mrlenb=%d", r->mrlenb);
 	return ERROR_OK;
 }
 
@@ -331,7 +396,12 @@ int riscv013_reg_examine_all(struct target *target)
 	if (res != ERROR_OK)
 		return res;
 
+	res = examine_mlenb(target);
+	if (res != ERROR_OK)
+		return res;
+
 	riscv_reg_impl_init_vector_reg_type(target);
+	riscv_reg_impl_init_matrix_reg_type(target);
 
 	res = examine_mtopi(target);
 	if (res != ERROR_OK)
